@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""Search clothing stores from the command line: name, price, colours, sizes, link.
+
+Stores: hm (H&M US), uniqlo (Uniqlo US), oldnavy (Old Navy US). Each is read
+through the JSON endpoint its own site calls, because the HTML pages are behind
+bot walls and the endpoints are not. kohls answers every script with 403, so it
+is read through a real Chrome window on a Mac (lib/kohls_browser.py) and is off
+until `shop.kohls.ssh_host` names one. Read-only: nothing is added to a cart.
+
+Settings, in the user's Herald config.json:
+  shop.sizes            {"tops": "L", "pants": "32/30", ...}; `--for tops` uses one
+  shop.kohls.ssh_host   an ssh host alias for a Mac with Google Chrome, for Kohl's
+"""
+import argparse, gzip, io, json, os, pathlib, re, sys, urllib.parse, urllib.request
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15"
+
+HOME = pathlib.Path(os.environ.get("HERALD_HOME", pathlib.Path.home() / ".herald"))
+
+
+def setting(path, default=None):
+    """One value from the user's config.json. Read directly rather than through
+    Herald's config module, so this script runs on the system python."""
+    try:
+        node = json.loads((HOME / "config.json").read_text())
+    except (OSError, ValueError):
+        return default
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return node
+
+
+def get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        b = r.read()
+    if b[:2] == b"\x1f\x8b":
+        b = gzip.decompress(b)
+    return json.loads(b)
+
+
+def hm(query, page, want):
+    qs = urllib.parse.urlencode({"touchPoint": "DESKTOP", "query": query, "page": page, "pageSize": 30})
+    for p in get_json("https://api.hm.com/search-services/v1/en_us/search/resultpage?" + qs)["searchHits"]["productList"]:
+        if not p.get("mainCatCode", "").startswith("men") or p.get("availability", {}).get("stockState") != "Available":
+            continue
+        have = {s["label"] for s in p.get("sizes", []) if s.get("stock", 0) > 0}
+        if want and not have & set(want):
+            continue
+        yield {"store": "hm", "name": p["productName"], "price": p["prices"][0]["formattedPrice"],
+               "color": p.get("colorName"), "sizes": sorted(have & set(want)) if want else sorted(have),
+               "stock_checked": True, "url": "https://www2.hm.com" + p["url"], "image": p.get("productImage"),
+               "immutable_image": True,
+               "other_colors": sorted({s["colorName"] for s in p.get("swatches", [])} - {p.get("colorName")})}
+
+
+def uniqlo(query, page, want):
+    qs = urllib.parse.urlencode({"q": query, "offset": page * 30, "limit": 30, "httpFailure": "true"})
+    for p in get_json("https://www.uniqlo.com/us/api/commerce/v5/en/products?" + qs)["result"]["items"]:
+        if p.get("genderName") not in ("MEN", "UNISEX"):
+            continue
+        # The listing names the sizes a style comes in, not which are in stock.
+        names = [z["name"] for z in p.get("sizes", [])]
+        pants = {w.split("/")[0] + "inch" for w in (want or []) if "/" in w}
+        if want and not (set(want) | pants) & set(names):
+            continue
+        code = p["representativeColorDisplayCode"] if "representativeColorDisplayCode" in p else None
+        img = p.get("images", {}).get("main", {}).get(code, {}).get("image")
+        colors = {c["displayCode"]: c["name"].title() for c in p.get("colors", [])}
+        pr = p["prices"]["promo"]["value"] if p["prices"].get("promo") else p["prices"]["base"]["value"]
+        yield {"store": "uniqlo", "name": p["name"], "price": f"${pr:.2f}", "color": colors.get(code),
+               "sizes": names, "stock_checked": False,
+               "url": f"https://www.uniqlo.com/us/en/products/{p['productId']}/{p.get('priceGroup', '00')}?colorDisplayCode={code}",
+               "image": img, "immutable_image": False,
+               "other_colors": sorted(set(colors.values()) - {colors.get(code)})}
+
+
+def oldnavy(query, page, want):
+    qs = urllib.parse.urlencode({"brand": "ON", "market": "us", "locale": "en_US", "keyword": query,
+                                 "pageSize": 30, "pageNumber": page})
+    for p in get_json("https://api.gap.com/commerce/search/products/v2/cc?" + qs)["products"]:
+        if not p.get("webProductType", "").startswith("mens"):
+            continue
+        cc = next((c for c in p["styleColors"] if c.get("inventoryStatus") == "In Stock"), None)
+        if not cc:
+            continue
+        img = next((i["path"] for i in cc["images"] if i["type"] == "Z"), None) or cc["images"][0]["path"]
+        yield {"store": "oldnavy", "name": p["styleName"], "price": f"${float(cc['effectivePrice']):.2f}",
+               "color": f"{cc['ccName']} ({cc.get('ccShortDescription', '')})".replace(" ()", ""),
+               "sizes": [], "stock_checked": False,
+               "url": f"https://oldnavy.gap.com/browse/product.do?pid={cc['ccId']}",
+               "image": "https://oldnavy.gap.com/" + img.lstrip("/"), "immutable_image": False,
+               "other_colors": sorted({c["ccName"] for c in p["styleColors"]} - {cc["ccName"]})}
+
+
+STORES = {"hm": hm, "uniqlo": uniqlo, "oldnavy": oldnavy}
+ALL_STORES = sorted(STORES) + ["kohls"]
+NOT_MENS = ("women", "woman", "ladies", "girls", "boys", "kids", "juniors", "toddler", "baby", "big & tall", "big-tall",
+            "petite", "plus size", "curvy", "maternity", "verla")
+# Kohl's marketplace sellers stack search words into the title ("..., Casual Loose Fit Denim Pants for
+# Streetwear"). Their photos often show women, and their prices run high. Real brands do not do this.
+MARKETPLACE = re.compile(r",.*,|, (casual|loose|vintage|relaxed|slim|classic|distressed)|for (streetwear|everyday|street|men|fall)|\b(y2k|streetwear)\b", re.I)
+
+
+MARKETPLACE_OK = [False]
+
+
+def kohls(queries, pages):
+    """Kohl's needs a real browser, so it runs as one batch in Herald's venv python."""
+    import shutil, subprocess
+    root = os.environ.get("HERALD_ROOT") or str(pathlib.Path(shutil.which("herald")).resolve().parents[1])
+    helper = pathlib.Path(__file__).resolve().parents[1] / "lib" / "kohls_browser.py"
+    host = setting("shop.kohls.ssh_host")
+    if not host:
+        raise RuntimeError("off: set shop.kohls.ssh_host to a Mac that runs Google Chrome")
+    r = subprocess.run([f"{root}/venv/bin/python", "-I", str(helper), json.dumps(queries), str(pages), host],
+                       capture_output=True, text=True, timeout=120 * len(queries) * pages)
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip().splitlines()[0] if r.stderr.strip() else "kohls helper failed")
+    if r.stderr.strip():
+        print(r.stderr.strip(), file=sys.stderr)
+    for k in json.loads(r.stdout):
+        t = k["title"].lower()
+        if not k["price"] or any(w in t for w in NOT_MENS) or any(w in k["url"] for w in ("womens", "boys", "girls", "kids")):
+            continue
+        if MARKETPLACE.search(k["title"]) and not MARKETPLACE_OK[0]:
+            continue
+        yield {"store": "kohls", "name": k["title"], "price": k["price"] + (f" (was {k['was']})" if k["was"] else ""),
+               "color": None, "sizes": [], "stock_checked": False, "url": k["url"],
+               "image": (k["image"] or "").split("?")[0] + "?wid=500&hei=500" if k["image"] else None,
+               "immutable_image": False, "other_colors": [], "query": k["query"]}
+
+
+# Image URLs on image.hm.com end in a hash of the file's content, so a cached
+# copy can never be stale: a changed picture gets a new URL. Search results have
+# no such guarantee and are never cached.
+CACHE = HOME / "ledger/raw/shop/images"
+THUMB = 480
+
+
+def thumb(url, immutable):
+    """Path to a THUMB-px-wide copy of the image. Cached forever when the URL is
+    content-addressed (H&M); fetched fresh each run otherwise, because the same
+    Uniqlo or Old Navy URL can later hold a different picture."""
+    from PIL import Image
+    key = pathlib.PurePosixPath(urllib.parse.urlparse(url).path).stem
+    if immutable:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        path = CACHE / (key + ".jpg")
+        if path.exists():
+            return path
+    else:
+        path = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / f"shop-{key}.jpg"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        im = Image.open(io.BytesIO(r.read())).convert("RGB")
+    im.thumbnail((THUMB, THUMB * 2))
+    im.save(path, quality=85)
+    return path
+
+
+SHEET, CELL = 24, 330
+
+
+def contact_sheet(items, out, start=1, cols=6, labels=None):
+    """One numbered grid of the results, so a session views one image, not twenty."""
+    from PIL import Image, ImageDraw
+    rows = (len(items) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * CELL, rows * (CELL * 4 // 3 + 30)), "white")
+    d = ImageDraw.Draw(sheet)
+    for n, o in enumerate(items):
+        x, y = (n % cols) * CELL, (n // cols) * (CELL * 4 // 3 + 30)
+        try:
+            im = Image.open(thumb(o["image"], o["immutable_image"]))
+            im.thumbnail((CELL, CELL * 4 // 3))
+            sheet.paste(im, (x + (CELL - im.width) // 2, y + 30))
+        except Exception:
+            pass
+        d.text((x + 4, y + 4), f"{labels[n] if labels else start + n}. [{o['store']}] {o['price'].split()[0]}", fill="black")
+        d.text((x + 4, y + 16), o["name"][:46], fill="black")
+    sheet.save(out, quality=82)
+
+
+def key(o):
+    return o["url"].split("?")[0] + (o["url"].split("pid=")[1] if "pid=" in o["url"] else "") + (o["color"] or "")
+
+
+def crawl(store, queries, pages, want):
+    got = []
+    if store == "kohls":
+        try:
+            got = list(kohls(queries, pages))
+        except Exception as e:
+            print(f"kohls: failed ({e})", file=sys.stderr)
+        return got
+    for q in queries:
+        for page in range(pages):
+            try:
+                got += [dict(o, query=q) for o in STORES[store](q, page + (store == "hm"), want)]
+            except Exception as e:
+                print(f"{store} '{q}' p{page}: failed ({type(e).__name__}: {e})", file=sys.stderr)
+                break
+    return got
+
+
+def main():
+    from concurrent.futures import ThreadPoolExecutor
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("query", nargs="*", help="one or more phrasings; results are merged and deduplicated")
+    ap.add_argument("-n", "--limit", type=int, default=0, help="cap per store after merging (0 = no cap)")
+    ap.add_argument("--pages", type=int, default=1, help="result pages per phrasing per store (H&M/Uniqlo/Old Navy 30 items, Kohl's 120)")
+    ap.add_argument("--store", action="append", choices=ALL_STORES, help="repeatable; default all four")
+    ap.add_argument("--sizes", help="comma list, e.g. L,XL or 32/30. Enforced only at H&M, the one store whose listing has per-size stock")
+    ap.add_argument("--for", dest="kind", metavar="KIND", help="use the user's sizes for this kind of garment from shop.sizes in config.json, e.g. tops or pants")
+    ap.add_argument("--max-price", type=float, help="drop items above this price")
+    ap.add_argument("--match", help="regex the item name must match, e.g. 'jacket|coat'; drops the off-topic results a store pads a search with")
+    ap.add_argument("--exclude", help="regex that drops an item when its name matches")
+    ap.add_argument("--marketplace", action="store_true", help="keep Kohl's third-party marketplace listings (dropped by default)")
+    ap.add_argument("--list", action="store_true", help="print one line per item, deduplicated by name (colour variants collapsed), numbered to match --pick")
+    ap.add_argument("--sheet", metavar="PREFIX", help="write numbered contact sheets PREFIX-1.jpg, PREFIX-2.jpg, ... (24 photos each)")
+    ap.add_argument("--out", metavar="JSON", help="write the merged results, in sheet order, to this file")
+    ap.add_argument("--from", dest="src", metavar="JSON", help="reuse a saved --out file instead of searching; with --pick and --sheet, a sheet of just those items")
+    ap.add_argument("--pick", help="comma list of item numbers from the saved file (1-based)")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    MARKETPLACE_OK[0] = a.marketplace
+    if a.src:
+        saved = json.loads(pathlib.Path(a.src).read_text())
+        if a.list:
+            seen = set()
+            for i, o in enumerate(saved, 1):
+                if (o["store"], o["name"].lower()) not in seen:
+                    seen.add((o["store"], o["name"].lower()))
+                    print(i, o["store"][0], o["price"].split()[0].lstrip("$"), o["name"][:58])
+            return
+        picks = [int(i) for i in a.pick.split(",")] if a.pick else range(1, len(saved) + 1)
+        out = [dict(saved[i - 1], n=i) for i in picks]
+        for i in range(0, len(out), SHEET):
+            path = f"{a.sheet}-{i // SHEET + 1}.jpg"
+            contact_sheet(out[i:i + SHEET], path, labels=[o["n"] for o in out[i:i + SHEET]])
+            print(f"contact sheet: {path}", file=sys.stderr)
+        return
+    if not a.query:
+        ap.error("give at least one query, or --from")
+
+    sizes = a.sizes
+    if not sizes and a.kind:
+        sizes = (setting("shop.sizes") or {}).get(a.kind)
+        if not sizes:
+            ap.error(f"config.json has no shop.sizes.{a.kind}; set it with "
+                     f"`herald config set shop.sizes.{a.kind} M`, or pass --sizes")
+    want = sizes.split(",") if sizes else None
+    stores = a.store or ALL_STORES
+    with ThreadPoolExecutor(len(stores)) as ex:
+        results = list(ex.map(lambda s: crawl(s, a.query, a.pages, want), stores))
+    out, seen = [], set()
+    for name, got in zip(stores, results):
+        n = 0
+        for o in got:
+            price = float(o["price"].split()[0].lstrip("$").replace(",", ""))
+            if a.match and not re.search(a.match, o["name"], re.I) or a.exclude and re.search(a.exclude, o["name"], re.I):
+                continue
+            if key(o) in seen or (a.max_price and price > a.max_price):
+                continue
+            seen.add(key(o))
+            out.append(o)
+            n += 1
+            if a.limit and n >= a.limit:
+                break
+    if a.out:
+        pathlib.Path(a.out).write_text(json.dumps(out, indent=1))
+    if a.sheet and out:
+        for i in range(0, len(out), SHEET):
+            path = f"{a.sheet}-{i // SHEET + 1}.jpg"
+            contact_sheet(out[i:i + SHEET], path, start=i + 1)
+            print(f"contact sheet: {path}", file=sys.stderr)
+    if a.json:
+        json.dump(out, sys.stdout, indent=1)
+        return
+    for n, o in enumerate(out, 1):
+        sz = ", ".join(o["sizes"]) if o["sizes"] else "sizes: see page"
+        print(f"{n}. [{o['store']}] {o['name']} | {o['price']} | {o['color'] or ''} | {sz}{'' if o['stock_checked'] else ' (stock not checked)'}")
+        print(f"   {o['url']}")
+
+
+if __name__ == "__main__":
+    main()

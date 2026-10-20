@@ -1,0 +1,41 @@
+{
+  "name": "shop",
+  "description": "Search H&M, Uniqlo, Old Navy and Kohl's (US) for clothes in the user's sizes and return links. Read through the JSON endpoints the stores' own sites call; nothing is ever added to a cart or bought.",
+  "version": "0.3.0",
+  "enabled": true,
+  "provides_capabilities": [
+    {
+      "key": "shop",
+      "title": "Clothes shopping",
+      "summary": "Links to items that are in stock in your sizes.",
+      "settings": [
+        "shop.sizes"
+      ],
+      "setup_hint": "herald config set shop.sizes.tops L, and shop.sizes.pants 32/30. Optional: shop.kohls.ssh_host, an ssh alias for a Mac with Google Chrome, turns Kohl's on."
+    }
+  ],
+  "requires_capabilities": [],
+  "setup": [
+    {
+      "key": "shop.sizes",
+      "type": "object",
+      "prompt": "Your sizes, one per kind of garment, as the stores label them",
+      "example": "{\"tops\": \"L\", \"hoodies\": \"L,XL\", \"pants\": \"32/30\"}"
+    },
+    {
+      "key": "shop.notes",
+      "prompt": "Anything about fit worth knowing (a kind you size up in, a cut you avoid). Optional",
+      "required": false
+    },
+    {
+      "key": "shop.kohls.ssh_host",
+      "prompt": "To search Kohl's: the ssh name of a Mac with Google Chrome that this machine can reach. Leave blank to skip Kohl's",
+      "required": false,
+      "example": "macbook"
+    }
+  ],
+  "steps": [
+    "Optional, for contact sheets of product photos: ~/herald/venv/bin/pip install pillow",
+    "Optional, for Kohl's: ~/herald/venv/bin/pip install playwright, and make the Mac reachable with `ssh <name>` using a key, with Google Chrome installed."
+  ]
+}
